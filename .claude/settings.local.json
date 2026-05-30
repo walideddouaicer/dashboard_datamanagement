@@ -9,7 +9,8 @@
       "PowerShell(docker run *)",
       "PowerShell(& \"C:\\\\Users\\\\PC\\\\Desktop\\\\ensa s8\\\\datamanagement\\\\Projets\\\\.venv\\\\Scripts\\\\pip.exe\" install pandas psycopg2-binary openpyxl streamlit plotly sqlalchemy 2>&1)",
       "Bash(/c/Users/PC/Desktop/ensa s8/datamanagement/Projets/.venv/Scripts/python.exe *)",
-      "Bash(\"/c/Users/PC/Desktop/ensa s8/datamanagement/Projets/.venv/Scripts/python.exe\" etl_datawarehouse.py)"
+      "Bash(\"/c/Users/PC/Desktop/ensa s8/datamanagement/Projets/.venv/Scripts/python.exe\" etl_datawarehouse.py)",
+      "Bash(pkill -f \"streamlit run app.py\")"
     ]
   }
 }
