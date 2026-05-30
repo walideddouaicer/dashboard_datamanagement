@@ -1,0 +1,28 @@
+📊 Notes & Résultats
+
+Moyenne par module (calculée automatiquement, mise à jour en temps réel)
+Notes détaillées par type d'évaluation : TP, TD, contrôle continu, projet, examen final
+Statut de validation par module : validé / en risque
+Classement de l'étudiant dans la classe
+Évolution des notes d'un semestre à un autre (courbes / graphiques)
+Écart par rapport à la moyenne de classe
+
+🚨 Absences
+
+Nombre total d'absences par module
+Statut des absences : justifiée / non justifiée / en attente de validation
+Seuil d'absences autorisées et niveau d'alerte
+Historique des absences par date et matière
+
+📝 Réclamations
+
+Nombre de réclamations déposées
+Statut des réclamations : reçue / en cours / traitée
+Délai de traitement affiché
+Historique des demandes et réponses
+
+📅 Événements & Alertes
+
+Calendrier académique : examens, soutenances, deadlines
+Notifications automatiques avant les échéances
+Centralisation des annonces (remplacement de WhatsApp / affichage)

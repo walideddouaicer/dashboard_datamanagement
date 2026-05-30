@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker run *)",
+      "Bash(docker start *)",
+      "Bash(Start-Process \"C:\\\\Program Files\\\\Docker\\\\Docker\\\\Docker Desktop.exe\" -WindowStyle Minimized)",
+      "Bash(Write-Host \"Docker Desktop launch initiated, waiting 30 seconds...\")",
+      "PowerShell(Start-Process \"C:\\\\Program Files\\\\Docker\\\\Docker\\\\Docker Desktop.exe\" -WindowStyle Minimized; Start-Sleep -Seconds 30; docker ps 2>&1)",
+      "PowerShell(docker run *)",
+      "PowerShell(& \"C:\\\\Users\\\\PC\\\\Desktop\\\\ensa s8\\\\datamanagement\\\\Projets\\\\.venv\\\\Scripts\\\\pip.exe\" install pandas psycopg2-binary openpyxl streamlit plotly sqlalchemy 2>&1)",
+      "Bash(/c/Users/PC/Desktop/ensa s8/datamanagement/Projets/.venv/Scripts/python.exe *)",
+      "Bash(\"/c/Users/PC/Desktop/ensa s8/datamanagement/Projets/.venv/Scripts/python.exe\" etl_datawarehouse.py)"
+    ]
+  }
+}

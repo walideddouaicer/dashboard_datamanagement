@@ -1,0 +1,29 @@
+📈 Statistiques & Performance
+
+Moyenne par promotion → line chart
+Moyenne par module → bar chart
+Nombre d'étudiants par tranche de notes → histogramme
+Affichage des profils : top 5 premiers / 5 derniers ou étudiants en dessous de la moyenne ou en dessous d'un seuil déterminé
+
+🚨 Absences
+
+Taux d'absence par module = nombre de séances manquées / nombre total de séances × 100
+Seuil d'absences dépassé = 1 si taux d'absence > seuil réglementaire (ex. 25%), sinon 0
+Évolution de l'absence dans le temps
+Absences justifiées / non justifiées → slicer (nom d'étudiant – module)
+
+⚠️ Score de Risque Étudiant
+
+Combinaison pondérée de :
+
+Baisse de moyenne sur les derniers contrôles (ex. chute > 2 points)
+Taux d'absence dépassant le seuil
+Nombre de travaux non rendus / nombre total de travaux attendus × 100
+
+
+
+📝 Réclamations
+
+Réclamations traitées / non traitées
+Types des réclamations
+Suivi des réclamations : réclamation déposée → statut (+ date si possible)
