@@ -168,14 +168,29 @@ def render_authenticated_sidebar():
 # PROFESSOR DASHBOARD
 # ─────────────────────────────────────────────
 
-def show_prof_dashboard(engine):
+def show_prof_dashboard(engine, univ_engine, user_id):
     st.title("👨‍🏫 Tableau de Bord Professeur")
 
-    # ── Dimension lists ───────────────────────
+    # ── Row-level security: modules taught by this professor ──
+    df_assigned = query(
+        univ_engine,
+        "SELECT code_module FROM enseigne WHERE id_prof = :pid",
+        pid=user_id,
+    )
+    if df_assigned.empty:
+        st.warning("Vous n'avez aucun module assigné pour le moment.")
+        return
+    assigned_codes = df_assigned["code_module"].tolist()
+
+    # ── Dimension lists (filtered to assigned modules only) ───
+    placeholders = ", ".join(f":c{i}" for i in range(len(assigned_codes)))
+    code_params  = {f"c{i}": v for i, v in enumerate(assigned_codes)}
     modules_df = query(
         engine,
-        "SELECT code_module, intitule, semestre, annee_etude "
-        "FROM DIM_MODULE ORDER BY semestre, intitule",
+        f"SELECT code_module, intitule, semestre, annee_etude "
+        f"FROM DIM_MODULE WHERE code_module IN ({placeholders}) "
+        f"ORDER BY semestre, intitule",
+        **code_params,
     )
     temps_df = query(
         engine,
@@ -788,7 +803,7 @@ if "role" not in st.session_state:
 
 elif st.session_state["role"] == "prof":
     render_authenticated_sidebar()
-    show_prof_dashboard(dwh_engine)
+    show_prof_dashboard(dwh_engine, univ_engine, st.session_state["user_id"])
 
 elif st.session_state["role"] == "student":
     render_authenticated_sidebar()
