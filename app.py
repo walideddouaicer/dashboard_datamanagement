@@ -11,7 +11,14 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 from datetime import date
+
+# Regulatory absence threshold (%). The stored FAIT_ABSENCES.seuil_depasse column
+# is computed by the ETL with an unrelated rule (unjustified count > 3) and is
+# always 'N', so the dashboard recomputes "seuil dépassé" live from taux_absence
+# against this threshold. Professors can override it with the sidebar slider.
+SEUIL_ABSENCE_DEFAUT = 25
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG  (must be first Streamlit call)
@@ -226,6 +233,13 @@ def gap(px: int = 12):
     st.markdown(f"<div style='margin-top:{px}px'></div>", unsafe_allow_html=True)
 
 
+def seuil_validation(annee_etude: str) -> int:
+    """Validation cutoff for a cohort, mirroring the ETL rule:
+    ≥10 for 1ère/2ème année, ≥12 for everyone else."""
+    a = (annee_etude or "").lower()
+    return 10 if ("1ere" in a or "2eme" in a) else 12
+
+
 def banner(title: str, subtitle: str = ""):
     """Dark gradient page banner replacing st.title()."""
     sub = (f'<p style="margin:5px 0 0;font-size:.84rem;'
@@ -262,9 +276,13 @@ def get_univ_engine():
     )
 
 
-@st.cache_data(ttl=60)
-def query(_engine, sql, **params):
-    with _engine.connect() as conn:
+# Hash the engine by its target DB (host/port/database) so identical SQL+params
+# against the two databases get separate cache entries instead of colliding.
+@st.cache_data(ttl=60, hash_funcs={
+    Engine: lambda e: f"{e.url.host}:{e.url.port}/{e.url.database}"
+})
+def query(engine, sql, **params):
+    with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params)
 
 
@@ -484,10 +502,32 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     code_mod = modules_df.loc[
         modules_df["intitule"] == selected_module, "code_module"
     ].values[0]
+    seuil_valid = seuil_validation(
+        modules_df.loc[modules_df["code_module"] == code_mod, "annee_etude"].values[0]
+    )
 
-    annees         = sorted(temps_df["annee_scolaire"].unique().tolist(), reverse=True)
-    selected_annee = st.sidebar.selectbox("Année scolaire", ["Toutes"] + annees)
-    seuil_absence  = st.sidebar.slider("Seuil d'absence (%)", 0, 100, 25, step=5)
+    # Default the year filter to the current (latest) school year that actually
+    # has enrolled students with notes in the professor's own modules — so the
+    # dashboard opens on the active cohort, not on all years at once. Phantom
+    # years (e.g. ones present in DIM_TEMPS only via reclamation dates, with no
+    # notes) are skipped for the default but remain selectable.
+    annees = sorted(temps_df["annee_scolaire"].unique().tolist(), reverse=True)
+    notes_years = query(
+        engine,
+        f"SELECT DISTINCT dt.annee_scolaire "
+        f"FROM FAIT_NOTES fn JOIN DIM_TEMPS dt ON fn.id_temps = dt.id_temps "
+        f"WHERE fn.code_module IN ({placeholders})",
+        **code_params,
+    )["annee_scolaire"].tolist()
+    annee_options = annees + ["Toutes"]
+    latest_with_data = next((a for a in annees if a in notes_years), None)
+    default_idx = (annee_options.index(latest_with_data)
+                   if latest_with_data is not None else len(annee_options) - 1)
+    selected_annee = st.sidebar.selectbox(
+        "Année scolaire", annee_options, index=default_idx
+    )
+    seuil_absence  = st.sidebar.slider("Seuil d'absence (%)", 0, 100,
+                                        SEUIL_ABSENCE_DEFAUT, step=5)
     seuil_note     = st.sidebar.slider("Seuil note alerte", 0.0, 20.0, 10.0, step=0.5)
 
     if selected_annee == "Toutes":
@@ -544,22 +584,23 @@ def show_prof_dashboard(engine, univ_engine, user_id):
                 labels={"annee_scolaire": "Année scolaire", "moyenne": "Moyenne /20"},
                 color_discrete_sequence=["#3B82F6"],
             )
-            fig.add_hline(y=10, line_dash="dash", line_color="#EF4444",
-                          annotation_text="Seuil 10",
+            fig.add_hline(y=seuil_valid, line_dash="dash", line_color="#EF4444",
+                          annotation_text=f"Seuil validation ({seuil_valid})",
                           annotation_font=dict(color="#EF4444", size=10))
             _theme(fig, 310)
             st.plotly_chart(fig, use_container_width=True)
 
     with c2:
-        q_bar = """
+        # Restricted to the professor's own assigned modules (row-level security)
+        q_bar = f"""
             SELECT dm.intitule AS module,
                    ROUND(AVG(fn.moyenne)::numeric, 2) AS moyenne
             FROM FAIT_NOTES fn
             JOIN DIM_MODULE dm ON fn.code_module = dm.code_module
             JOIN DIM_TEMPS dt  ON fn.id_temps = dt.id_temps
-            WHERE 1=1
+            WHERE dm.code_module IN ({placeholders})
         """
-        params_bar: dict = {}
+        params_bar: dict = dict(code_params)
         if selected_annee != "Toutes":
             q_bar += " AND dt.annee_scolaire = :annee"
             params_bar["annee"] = selected_annee
@@ -568,7 +609,7 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         if not df_bar.empty:
             fig2 = px.bar(
                 df_bar, x="moyenne", y="module", orientation="h",
-                title="Classement des modules par moyenne",
+                title="Classement de vos modules par moyenne",
                 color="moyenne",
                 color_continuous_scale="RdYlGn",
                 range_color=[8, 16],
@@ -584,12 +625,9 @@ def show_prof_dashboard(engine, univ_engine, user_id):
             labels={"moyenne": "Moyenne /20", "count": "Étudiants"},
             color_discrete_sequence=["#64748B"],
         )
-        fig3.add_vline(x=10, line_dash="dash", line_color="#EF4444",
-                       annotation_text="Seuil 10",
+        fig3.add_vline(x=seuil_valid, line_dash="dash", line_color="#EF4444",
+                       annotation_text=f"Seuil validation ({seuil_valid})",
                        annotation_font=dict(color="#EF4444", size=10))
-        fig3.add_vline(x=12, line_dash="dot",  line_color="#F59E0B",
-                       annotation_text="Seuil 12",
-                       annotation_font=dict(color="#F59E0B", size=10))
         _theme(fig3, 260)
         st.plotly_chart(fig3, use_container_width=True)
 
@@ -631,10 +669,21 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     df_abs = query(engine, q_abs, **time_params)
 
     if not df_abs.empty:
+        # Recompute seuil dépassé live: the stored column is always 'N'. A student
+        # is over the threshold if their absence rate exceeds the slider value.
+        df_abs["seuil_depasse"] = (
+            df_abs["taux_absence"].gt(seuil_absence).map({True: "O", False: "N"})
+        )
+
         col_a1, col_a2, col_a3 = st.columns(3)
-        col_a1.metric("Taux d'absence moyen",    f"{df_abs['taux_absence'].mean():.1f} %")
-        n_depasse = df_abs.drop_duplicates("etudiant")["seuil_depasse"].eq("O").sum()
+        # Average over students (taux_absence repeats per séance row), not over rows.
+        taux_par_etud = df_abs.groupby("etudiant")["taux_absence"].max()
+        col_a1.metric("Taux d'absence moyen",    f"{taux_par_etud.mean():.1f} %")
+        n_depasse = (taux_par_etud > seuil_absence).sum()
         col_a2.metric("Étudiants seuil dépassé", int(n_depasse))
+        # Event-grained on purpose: justifiee is a real per-séance flag (not a
+        # duplicated aggregate like taux_absence), so the share of *all* absences
+        # that are justified is the row-level mean — not an average of per-student rates.
         pct_just = (df_abs["justifiee"] == "O").mean() * 100
         col_a3.metric("Absences justifiées",      f"{pct_just:.0f} %")
 
@@ -676,7 +725,19 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     section("⚠️", "Score de Risque Étudiant")
 
     if not df_notes.empty:
-        df_risk = df_notes[["etudiant", "moyenne", "statut_validation"]].copy()
+        # Component 1 of the risk score (per KPI spec): "baisse de moyenne sur les
+        # derniers contrôles". Evaluations run chronologically TP/CC (premiers
+        # contrôles) → Projet/Examen (derniers). The drop between the two phases is
+        # the decline signal; cross-year history isn't available (one year/module
+        # per student), so the trend is measured across a module's evaluations.
+        premiers = df_notes[["note_tp", "note_cc"]].mean(axis=1)
+        derniers = df_notes[["note_projet", "note_examen"]].mean(axis=1)
+        df_notes = df_notes.assign(
+            baisse_moyenne=(premiers - derniers).clip(lower=0).round(1).fillna(0.0)
+        )
+        df_risk = df_notes[
+            ["etudiant", "moyenne", "baisse_moyenne", "statut_validation"]
+        ].copy()
 
         if not df_abs.empty:
             abs_by_stud = (
@@ -713,11 +774,13 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         df_risk["taux_absence"]   = df_risk["taux_absence"].fillna(0.0)
         df_risk["seuil_depasse"]  = df_risk["seuil_depasse"].fillna("N")
 
-        note_norm = ((20 - df_risk["moyenne"].clip(0, 20)) / 20 * 40).round(1)
-        abs_norm  = (df_risk["taux_absence"].clip(0, 100) / 100 * 35).round(1)
-        trav_norm = (df_risk["taux_non_rendu"].clip(0, 100) / 100 * 25).round(1)
+        # Weighted combination of the three spec factors (decline / absence / travaux).
+        # A 6-point drop between phases saturates the grade component.
+        baisse_norm = (df_risk["baisse_moyenne"].clip(0, 6) / 6 * 40).round(1)
+        abs_norm    = (df_risk["taux_absence"].clip(0, 100) / 100 * 35).round(1)
+        trav_norm   = (df_risk["taux_non_rendu"].clip(0, 100) / 100 * 25).round(1)
 
-        df_risk["score_risque"]  = (note_norm + abs_norm + trav_norm).clip(0, 100).round(1)
+        df_risk["score_risque"]  = (baisse_norm + abs_norm + trav_norm).clip(0, 100).round(1)
         df_risk["niveau_risque"] = pd.cut(
             df_risk["score_risque"],
             bins=[-1, 30, 55, 100],
@@ -742,9 +805,9 @@ def show_prof_dashboard(engine, univ_engine, user_id):
 
         st.dataframe(
             df_risk[[
-                "etudiant", "moyenne", "taux_absence",
+                "etudiant", "moyenne", "baisse_moyenne", "taux_absence",
                 "taux_non_rendu", "score_risque", "niveau_risque",
-            ]],
+            ]].rename(columns={"baisse_moyenne": "baisse_controles"}),
             use_container_width=True,
         )
 
@@ -765,9 +828,9 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         JOIN DIM_PROF dp     ON fr.id_prof    = dp.id_prof
         JOIN DIM_MODULE dm   ON fr.code_module = dm.code_module
         JOIN DIM_TEMPS dt    ON fr.id_temps   = dt.id_temps
-        WHERE fr.code_module = :code_mod
+        WHERE fr.code_module = :code_mod AND fr.id_prof = :pid
     """
-    params_reclam: dict = {"code_mod": code_mod}
+    params_reclam: dict = {"code_mod": code_mod, "pid": user_id}
     if selected_annee != "Toutes":
         q_reclam += " AND dt.annee_scolaire = :annee"
         params_reclam["annee"] = selected_annee
@@ -827,6 +890,7 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
         f"👨‍🎓 Espace Étudiant",
         f"{user_name}  ·  Apogée {num_apogee}  ·  {annee_etude}",
     )
+    seuil_valid = seuil_validation(annee_etude)
 
     # ════════════════════════════
     #  1 — NOTES & RÉSULTATS
@@ -882,12 +946,9 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
             labels={"periode": "Période", "moyenne": "Moyenne /20"},
             color_discrete_sequence=["#3B82F6"],
         )
-        fig_evo.add_hline(y=10, line_dash="dash", line_color="#EF4444",
-                          annotation_text="Seuil 10",
+        fig_evo.add_hline(y=seuil_valid, line_dash="dash", line_color="#EF4444",
+                          annotation_text=f"Seuil validation ({seuil_valid})",
                           annotation_font=dict(color="#EF4444", size=10))
-        fig_evo.add_hline(y=12, line_dash="dot",  line_color="#F59E0B",
-                          annotation_text="Seuil 12",
-                          annotation_font=dict(color="#F59E0B", size=10))
         _theme(fig_evo, 300)
         st.plotly_chart(fig_evo, use_container_width=True)
 
@@ -920,8 +981,10 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
                 title="Validation par module",
                 labels={"module": "Module", "moyenne": "Moyenne /20"},
             )
-            fig_val.add_hline(y=10, line_dash="dash",
-                              line_color="#94A3B8", line_width=1)
+            fig_val.add_hline(y=seuil_valid, line_dash="dash",
+                              line_color="#94A3B8", line_width=1,
+                              annotation_text=f"Seuil validation ({seuil_valid})",
+                              annotation_font=dict(color="#64748B", size=10))
             fig_val.update_xaxes(tickangle=40)
             _theme(fig_val, 320)
             st.plotly_chart(fig_val, use_container_width=True)
@@ -958,15 +1021,27 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
 
     if not df_stud_abs.empty:
         col_a1, col_a2, col_a3 = st.columns(3)
-        col_a1.metric("Total absences",      int(df_stud_abs["nb_absences_total"].iloc[0]))
+        # nb_absences_total repeats on every séance row of a given module/year,
+        # so .iloc[0] would only show the most recent module's count. Each module
+        # maps to one semester, so (module × année) is the fact grain: de-duplicate
+        # to it, then sum to get the student's total absences across all modules.
+        total_abs = int(
+            df_stud_abs.drop_duplicates(["module", "annee_scolaire"])["nb_absences_total"].sum()
+        )
+        col_a1.metric("Total absences",      total_abs)
         pct_just = (df_stud_abs["justifiee"] == "O").mean() * 100
         col_a2.metric("Absences justifiées", f"{pct_just:.0f} %")
+        # Recompute against the regulatory threshold: the stored seuil_depasse is
+        # always 'N'. Students are flagged when any module's rate exceeds it.
+        df_stud_abs["seuil_depasse"] = (
+            df_stud_abs["taux_absence"].gt(SEUIL_ABSENCE_DEFAUT).map({True: "O", False: "N"})
+        )
         any_depasse = (df_stud_abs["seuil_depasse"] == "O").any()
         col_a3.metric("Seuil dépassé",       "⚠️ OUI" if any_depasse else "✅ NON")
 
         gap(8)
         taux_max = float(df_stud_abs["taux_absence"].max())
-        bar_color = "#EF4444" if taux_max > 25 else "#10B981"
+        bar_color = "#EF4444" if taux_max > SEUIL_ABSENCE_DEFAUT else "#10B981"
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge+number",
             value=taux_max,
@@ -981,7 +1056,6 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
                     "range": [0, 100],
                     "tickfont": {"size": 10, "color": "#94A3B8"},
                     "tickcolor": "#E2E8F0",
-                    "linecolor": "#E2E8F0",
                 },
                 "bar": {"color": bar_color, "thickness": 0.22},
                 "bgcolor": "rgba(0,0,0,0)",
@@ -994,7 +1068,7 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
                 "threshold": {
                     "line": {"color": "#EF4444", "width": 3},
                     "thickness": 0.75,
-                    "value": 25,
+                    "value": SEUIL_ABSENCE_DEFAUT,
                 },
             },
         ))
@@ -1068,15 +1142,20 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
     # ════════════════════════════
     section("📅", "Événements & Alertes")
 
-    # Events live in the Universite source DB, joined with modules there
+    # Events live in the Universite source DB, joined with modules there.
+    # Scope them to the student's year of study: modules and students share the
+    # same "Neme annee" vocabulary, so an event is relevant when its module is
+    # taught in the student's année. Graduates ("Laureat …") match no module
+    # année and therefore see no upcoming events, which is the intended behaviour.
     q_events = """
         SELECT ev.type_evenement, ev.objet, ev.date_evenement,
                ev.heure_evenement, m.intitule AS module, ev.promotion
         FROM evenements ev
         JOIN modules m ON ev.code_module = m.code_module
+        WHERE m.annee_etude = :ae
         ORDER BY ev.date_evenement ASC
     """
-    df_events = query(univ_engine, q_events)
+    df_events = query(univ_engine, q_events, ae=annee_etude)
 
     if not df_events.empty:
         today = date.today()
