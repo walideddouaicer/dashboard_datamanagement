@@ -724,30 +724,25 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     # ════════════════════════════
     section("⚠️", "Score de Risque Étudiant")
 
+    st.caption(
+        "Un étudiant est signalé selon trois règles simples ; le niveau correspond "
+        "au nombre de facteurs déclenchés (seuils réglables dans la barre latérale)."
+    )
+
     if not df_notes.empty:
-        # Component 1 of the risk score (per KPI spec): "baisse de moyenne sur les
-        # derniers contrôles". Evaluations run chronologically TP/CC (premiers
-        # contrôles) → Projet/Examen (derniers). The drop between the two phases is
-        # the decline signal; cross-year history isn't available (one year/module
-        # per student), so the trend is measured across a module's evaluations.
-        premiers = df_notes[["note_tp", "note_cc"]].mean(axis=1)
-        derniers = df_notes[["note_projet", "note_examen"]].mean(axis=1)
-        df_notes = df_notes.assign(
-            baisse_moyenne=(premiers - derniers).clip(lower=0).round(1).fillna(0.0)
-        )
-        df_risk = df_notes[
-            ["etudiant", "moyenne", "baisse_moyenne", "statut_validation"]
-        ].copy()
+        # Simple, explainable risk: count how many of three threshold-based factors
+        # each student trips — no weighting. Two of the three thresholds are the
+        # professor's own sidebar sliders (seuil_note, seuil_absence).
+        df_risk = df_notes[["etudiant", "moyenne"]].copy()
 
         if not df_abs.empty:
             abs_by_stud = (
                 df_abs.drop_duplicates(["etudiant"])
-                      .set_index("etudiant")[["taux_absence", "seuil_depasse"]]
+                      .set_index("etudiant")["taux_absence"]
             )
             df_risk = df_risk.join(abs_by_stud, on="etudiant")
         else:
-            df_risk["taux_absence"]  = 0.0
-            df_risk["seuil_depasse"] = "N"
+            df_risk["taux_absence"] = 0.0
 
         q_trav = f"""
             SELECT de.nom || ' ' || de.prenom AS etudiant,
@@ -770,44 +765,62 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         else:
             df_risk["taux_non_rendu"] = 0.0
 
-        df_risk["taux_non_rendu"] = df_risk["taux_non_rendu"].fillna(0.0)
         df_risk["taux_absence"]   = df_risk["taux_absence"].fillna(0.0)
-        df_risk["seuil_depasse"]  = df_risk["seuil_depasse"].fillna("N")
+        df_risk["taux_non_rendu"] = df_risk["taux_non_rendu"].fillna(0.0)
 
-        # Weighted combination of the three spec factors (decline / absence / travaux).
-        # A 6-point drop between phases saturates the grade component.
-        baisse_norm = (df_risk["baisse_moyenne"].clip(0, 6) / 6 * 40).round(1)
-        abs_norm    = (df_risk["taux_absence"].clip(0, 100) / 100 * 35).round(1)
-        trav_norm   = (df_risk["taux_non_rendu"].clip(0, 100) / 100 * 25).round(1)
-
-        df_risk["score_risque"]  = (baisse_norm + abs_norm + trav_norm).clip(0, 100).round(1)
-        df_risk["niveau_risque"] = pd.cut(
-            df_risk["score_risque"],
-            bins=[-1, 30, 55, 100],
-            labels=["🟢 Faible", "🟡 Moyen", "🔴 Élevé"],
+        # Three plain rules → a 0–3 count of triggered risk factors.
+        SEUIL_NON_RENDU = 50  # % of travaux not handed in
+        flag_note = df_risk["moyenne"]      < seuil_note
+        flag_abs  = df_risk["taux_absence"] > seuil_absence
+        flag_trav = df_risk["taux_non_rendu"] > SEUIL_NON_RENDU
+        df_risk["nb_facteurs"] = (
+            flag_note.astype(int) + flag_abs.astype(int) + flag_trav.astype(int)
         )
-        df_risk = df_risk.sort_values("score_risque", ascending=False)
 
-        fig_risk = px.bar(
-            df_risk.head(20), x="etudiant", y="score_risque",
-            color="niveau_risque",
-            color_discrete_map={
-                "🟢 Faible": "#10B981",
-                "🟡 Moyen":  "#F59E0B",
-                "🔴 Élevé":  "#EF4444",
-            },
-            title="Score de risque par étudiant (top 20)",
-            labels={"score_risque": "Score / 100", "etudiant": "Étudiant"},
+        def _facteurs(row):
+            labels = []
+            if row["moyenne"] < seuil_note:              labels.append("Note faible")
+            if row["taux_absence"] > seuil_absence:       labels.append("Absentéisme")
+            if row["taux_non_rendu"] > SEUIL_NON_RENDU:   labels.append("Travaux non rendus")
+            return ", ".join(labels) if labels else "—"
+        df_risk["facteurs"] = df_risk.apply(_facteurs, axis=1)
+        df_risk["niveau"] = df_risk["nb_facteurs"].map(
+            {0: "🟢 Faible", 1: "🟡 Moyen", 2: "🔴 Élevé", 3: "🔴 Élevé"}
         )
-        fig_risk.update_xaxes(tickangle=40)
-        _theme(fig_risk, 350)
-        st.plotly_chart(fig_risk, use_container_width=True)
+        df_risk = df_risk.sort_values(["nb_facteurs", "moyenne"], ascending=[False, True])
+
+        c_r1, c_r2, c_r3 = st.columns(3)
+        c_r1.metric("🔴 Risque élevé", int((df_risk["nb_facteurs"] >= 2).sum()))
+        c_r2.metric("🟡 Risque moyen", int((df_risk["nb_facteurs"] == 1).sum()))
+        c_r3.metric("🟢 Faible",        int((df_risk["nb_facteurs"] == 0).sum()))
+
+        gap(8)
+        at_risk = df_risk[df_risk["nb_facteurs"] >= 1]
+        if not at_risk.empty:
+            fig_risk = px.bar(
+                at_risk.head(20), x="etudiant", y="nb_facteurs",
+                color="niveau",
+                color_discrete_map={"🟡 Moyen": "#F59E0B", "🔴 Élevé": "#EF4444"},
+                title="Étudiants à risque — nombre de facteurs déclenchés",
+                labels={"nb_facteurs": "Facteurs (0–3)", "etudiant": "Étudiant"},
+                hover_data=["facteurs"],
+            )
+            fig_risk.update_yaxes(dtick=1, range=[0, 3])
+            fig_risk.update_xaxes(tickangle=40)
+            _theme(fig_risk, 350)
+            st.plotly_chart(fig_risk, use_container_width=True)
+        else:
+            st.success("✅ Aucun étudiant à risque selon les seuils actuels.")
 
         st.dataframe(
             df_risk[[
-                "etudiant", "moyenne", "baisse_moyenne", "taux_absence",
-                "taux_non_rendu", "score_risque", "niveau_risque",
-            ]].rename(columns={"baisse_moyenne": "baisse_controles"}),
+                "etudiant", "moyenne", "taux_absence",
+                "taux_non_rendu", "facteurs", "niveau",
+            ]].rename(columns={
+                "etudiant": "Étudiant", "moyenne": "Moyenne",
+                "taux_absence": "Absence (%)", "taux_non_rendu": "Travaux non rendus (%)",
+                "facteurs": "Facteurs déclencheurs", "niveau": "Niveau",
+            }),
             use_container_width=True,
         )
 
