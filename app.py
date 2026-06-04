@@ -553,7 +553,8 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     df_moy_annee = query(engine, q_moy_annee, **time_params)
 
     q_notes = f"""
-        SELECT de.nom || ' ' || de.prenom AS etudiant,
+        SELECT de.num_apogee,
+               de.nom || ' ' || de.prenom AS etudiant,
                fn.note_tp, fn.note_cc, fn.note_projet, fn.note_examen,
                fn.moyenne, fn.classement, fn.ecart_moyenne_classe,
                fn.statut_validation, dt.annee_scolaire
@@ -565,13 +566,15 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     """
     df_notes = query(engine, q_notes, **time_params)
 
-    col1, col2, col3, col4 = st.columns(4)
     if not df_notes.empty:
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Moyenne générale",   f"{df_notes['moyenne'].mean():.2f} / 20")
-        col2.metric("Note maximale",      f"{df_notes['moyenne'].max():.2f} / 20")
-        col3.metric("Note minimale",      f"{df_notes['moyenne'].min():.2f} / 20")
+        col2.metric("Moyenne max",        f"{df_notes['moyenne'].max():.2f} / 20")
+        col3.metric("Moyenne min",        f"{df_notes['moyenne'].min():.2f} / 20")
         pct_val = (df_notes["statut_validation"] == "Valide").mean() * 100
         col4.metric("Taux de validation", f"{pct_val:.0f} %")
+    else:
+        st.info("Aucune note enregistrée pour ce module / cette période.")
 
     gap(8)
     c1, c2 = st.columns(2)
@@ -677,7 +680,8 @@ def show_prof_dashboard(engine, univ_engine, user_id):
 
         col_a1, col_a2, col_a3 = st.columns(3)
         # Average over students (taux_absence repeats per séance row), not over rows.
-        taux_par_etud = df_abs.groupby("etudiant")["taux_absence"].max()
+        # Keyed by num_apogee, not name, so students with identical names aren't merged.
+        taux_par_etud = df_abs.groupby("num_apogee")["taux_absence"].max()
         col_a1.metric("Taux d'absence moyen",    f"{taux_par_etud.mean():.1f} %")
         n_depasse = (taux_par_etud > seuil_absence).sum()
         col_a2.metric("Étudiants seuil dépassé", int(n_depasse))
@@ -733,26 +737,27 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         # Simple, explainable risk: count how many of three threshold-based factors
         # each student trips — no weighting. Two of the three thresholds are the
         # professor's own sidebar sliders (seuil_note, seuil_absence).
-        df_risk = df_notes[["etudiant", "moyenne"]].copy()
+        # Keyed by num_apogee throughout, so two students with the same name aren't
+        # merged; the display name is carried along only for labels.
+        df_risk = df_notes[["num_apogee", "etudiant", "moyenne"]].copy()
 
         if not df_abs.empty:
             abs_by_stud = (
-                df_abs.drop_duplicates(["etudiant"])
-                      .set_index("etudiant")["taux_absence"]
+                df_abs.drop_duplicates(["num_apogee"])
+                      .set_index("num_apogee")["taux_absence"]
             )
-            df_risk = df_risk.join(abs_by_stud, on="etudiant")
+            df_risk = df_risk.join(abs_by_stud, on="num_apogee")
         else:
             df_risk["taux_absence"] = 0.0
 
         q_trav = f"""
-            SELECT de.nom || ' ' || de.prenom AS etudiant,
+            SELECT ft.num_apogee,
                    COUNT(*) FILTER (WHERE ft.rendu = 'N') AS non_rendus,
                    COUNT(*) AS total_travaux
             FROM FAIT_TRAVAUX ft
-            JOIN DIM_ETUDIANT de ON ft.num_apogee = de.num_apogee
-            JOIN DIM_TEMPS dt    ON ft.id_temps = dt.id_temps
+            JOIN DIM_TEMPS dt ON ft.id_temps = dt.id_temps
             WHERE ft.code_module = :code_mod {time_filter}
-            GROUP BY etudiant
+            GROUP BY ft.num_apogee
         """
         df_trav_risk = query(engine, q_trav, **time_params)
         if not df_trav_risk.empty:
@@ -760,7 +765,7 @@ def show_prof_dashboard(engine, univ_engine, user_id):
                 df_trav_risk["non_rendus"] / df_trav_risk["total_travaux"] * 100
             ).round(1)
             df_risk = df_risk.merge(
-                df_trav_risk[["etudiant", "taux_non_rendu"]], on="etudiant", how="left"
+                df_trav_risk[["num_apogee", "taux_non_rendu"]], on="num_apogee", how="left"
             )
         else:
             df_risk["taux_non_rendu"] = 0.0

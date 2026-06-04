@@ -38,6 +38,26 @@ DWH_DB_CONFIG = {
 NB_SEANCES_TOTAL = 14
 DOSSIER_EXCEL = 'excel_files'
 
+# Explicit aliases: Excel module names that differ from the source DB intitulé by
+# extra/missing words (so neither exact nor underscore-normalisation matches).
+# Each maps the Excel module name -> source code_module. Reviewed 1:1 mapping.
+MODULE_ALIASES = {
+    'Competences_Numeriques_Programmation': 'INFO201',  # Programmation
+    'Complexes_structures_donnees':         'INFO101',  # Structures donnees
+    'Electromagnetisme_Electrocinetique':   'P101',     # Electromagnetisme
+    'Electronique_analogique_numerique':    'ELEC101',  # Electronique
+    'Fonctions_variables_reelles':          'M202',     # Fonctions reelles
+    'Mecanique_solide_systemes':            'MEC101',   # Mecanique solide
+    'Modelisation_simulation_numerique':    'SIM101',   # Modelisation
+    'Optimisation_systemes_industriels':    'OPT101',   # Optimisation
+    'Optique_geometrique_instrumentale':    'P102',     # Optique geometrique
+    'Optique_physique_lasers':              'P203',     # Optique physique
+    'Reseaux_locaux_protocoles':            'RES101',   # Reseaux protocoles
+    'Securite_des_donnees':                 'SECU101',  # Securite donnees
+    'Statistique_inferentielle':            'STAT101',  # Statistique
+    'Traitement_de_signal':                 'SIG101',   # Traitement signal
+}
+
 # ==================== FONCTIONS DE BASE ====================
 
 def get_db_connection(config):
@@ -75,7 +95,14 @@ def find_code_module(conn_source, intitule_module):
         if normalize_string(intitule) == normalized_input:
             print(f"    [INFO] Module trouve avec normalisation: '{intitule_module}' -> '{intitule}'")
             return code_module
-    
+
+    # 3. ALIAS EXPLICITE (noms Excel differents de l'intitule source)
+    if intitule_module in MODULE_ALIASES:
+        code_module = MODULE_ALIASES[intitule_module]
+        if any(cm == code_module for cm, _ in modules):
+            print(f"    [INFO] Module trouve via alias: '{intitule_module}' -> {code_module}")
+            return code_module
+
     print(f"    [WARN] Module '{intitule_module}' non trouve dans la base source")
     return None
 
