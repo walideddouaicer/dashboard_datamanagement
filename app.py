@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-from datetime import date
+from datetime import date, time
 
 # Regulatory absence threshold (%). The stored FAIT_ABSENCES.seuil_depasse column
 # is computed by the ETL with an unrelated rule (unjustified count > 3) and is
@@ -542,15 +542,18 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     # ════════════════════════════
     section("📈", "Statistiques & Performance")
 
-    q_moy_annee = f"""
+    # This trend chart intentionally spans ALL years for the module, ignoring the
+    # year filter — otherwise the line collapses to a single point on the default
+    # (current-year) view. The rest of the dashboard still respects the filter.
+    q_moy_annee = """
         SELECT dt.annee_scolaire, ROUND(AVG(fn.moyenne)::numeric, 2) AS moyenne
         FROM FAIT_NOTES fn
         JOIN DIM_TEMPS dt ON fn.id_temps = dt.id_temps
-        WHERE fn.code_module = :code_mod {time_filter}
+        WHERE fn.code_module = :code_mod
         GROUP BY dt.annee_scolaire
         ORDER BY dt.annee_scolaire
     """
-    df_moy_annee = query(engine, q_moy_annee, **time_params)
+    df_moy_annee = query(engine, q_moy_annee, code_mod=code_mod)
 
     q_notes = f"""
         SELECT de.num_apogee,
@@ -582,7 +585,7 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         if not df_moy_annee.empty:
             fig = px.line(
                 df_moy_annee, x="annee_scolaire", y="moyenne",
-                title=f"Évolution de la moyenne — {selected_module}",
+                title=f"Évolution de la moyenne par année — {selected_module}",
                 markers=True,
                 labels={"annee_scolaire": "Année scolaire", "moyenne": "Moyenne /20"},
                 color_discrete_sequence=["#3B82F6"],
@@ -896,6 +899,212 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         )
     else:
         st.info("Aucune réclamation pour ce module / cette période.")
+
+    # ════════════════════════════
+    #  5 — RÉSERVATION DE SALLES
+    # ════════════════════════════
+    section("🏛️", "Réservation de Salles")
+
+    salles_df = query(
+        univ_engine,
+        "SELECT id_salle, nom, type, capacite, batiment, etage "
+        "FROM salles ORDER BY type, nom",
+    )
+    mods_ens = query(
+        univ_engine,
+        "SELECT m.code_module, m.intitule FROM enseigne e "
+        "JOIN modules m ON e.code_module = m.code_module "
+        "WHERE e.id_prof = :pid ORDER BY m.intitule",
+        pid=user_id,
+    )
+    q_myres = """
+        SELECT r.id_reservation, s.nom AS salle, s.type, m.intitule AS module,
+               r.date_reservation, r.heure_debut, r.heure_fin, r.statut
+        FROM reservations_salles r
+        JOIN salles s  ON r.id_salle    = s.id_salle
+        JOIN modules m ON r.code_module = m.code_module
+        WHERE r.id_prof = :pid
+        ORDER BY r.date_reservation DESC, r.heure_debut
+    """
+    my_res = query(univ_engine, q_myres, pid=user_id)
+
+    col_res1, col_res2 = st.columns(2)
+    n_active = int((my_res["statut"] == "confirmee").sum()) if not my_res.empty else 0
+    col_res1.metric("Mes réservations actives", n_active)
+    col_res2.metric("Salles (total)", len(salles_df))
+
+    # ── Disponibilité par date (with type / capacity filters) ──
+    gap(8)
+    st.markdown("**Disponibilité des salles**")
+    dc1, dc2, dc3 = st.columns([1.2, 1.4, 1])
+    with dc1:
+        dispo_date = st.date_input("Date à consulter", value=date.today(), key="dispo_date")
+    with dc2:
+        types_sel = st.multiselect(
+            "Type de salle", salles_df["type"].unique().tolist(), key="dispo_types"
+        )
+    with dc3:
+        cap_min = st.number_input(
+            "Capacité min.", min_value=0,
+            max_value=int(salles_df["capacite"].max()), value=0, step=5, key="dispo_cap"
+        )
+
+    dispo = query(
+        univ_engine,
+        """
+        SELECT s.id_salle, r.heure_debut, r.heure_fin, m.intitule AS module
+        FROM salles s
+        LEFT JOIN reservations_salles r
+               ON s.id_salle = r.id_salle
+              AND r.date_reservation = :d AND r.statut = 'confirmee'
+        LEFT JOIN modules m ON r.code_module = m.code_module
+        ORDER BY s.id_salle, r.heure_debut
+        """,
+        d=dispo_date,
+    )
+    salles_filt = salles_df.copy()
+    if types_sel:
+        salles_filt = salles_filt[salles_filt["type"].isin(types_sel)]
+    salles_filt = salles_filt[salles_filt["capacite"] >= cap_min]
+
+    rows = []
+    for _, s in salles_filt.iterrows():
+        booked = dispo[(dispo["id_salle"] == s["id_salle"]) & dispo["heure_debut"].notna()]
+        if booked.empty:
+            statut_salle, creneaux = "🟢 Libre", "—"
+        else:
+            statut_salle = "🔴 Occupée"
+            creneaux = " ; ".join(
+                f"{b['heure_debut']}–{b['heure_fin']} ({b['module']})"
+                for _, b in booked.iterrows()
+            )
+        rows.append({"Salle": s["nom"], "Type": s["type"],
+                     "Capacité": int(s["capacite"]), "Statut": statut_salle,
+                     "Créneaux réservés": creneaux})
+    dispo_table = pd.DataFrame(rows)
+    if not dispo_table.empty:
+        n_libre = int((dispo_table["Statut"] == "🟢 Libre").sum())
+        st.caption(f"{n_libre}/{len(dispo_table)} salle(s) libre(s) le "
+                   f"{dispo_date.strftime('%d/%m/%Y')}.")
+        st.dataframe(dispo_table, use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucune salle ne correspond aux filtres.")
+
+    # ── Mes réservations actives (+ annulation) ──
+    # Show only confirmed bookings: a cancelled one disappears from both the
+    # table and the dropdown together (cancelled rows are kept in the DB as
+    # statut='annulee' for history, just not surfaced here).
+    gap(8)
+    st.markdown("**Mes réservations**")
+    my_active = my_res[my_res["statut"] == "confirmee"] if not my_res.empty else my_res
+    if not my_active.empty:
+        st.dataframe(
+            my_active[["salle", "type", "module", "date_reservation",
+                       "heure_debut", "heure_fin"]].rename(columns={
+                "salle": "Salle", "type": "Type", "module": "Module",
+                "date_reservation": "Date", "heure_debut": "Début",
+                "heure_fin": "Fin",
+            }),
+            use_container_width=True,
+        )
+        opts = {
+            f"{r['salle']} — {r['date_reservation']} "
+            f"{r['heure_debut']}–{r['heure_fin']}": int(r["id_reservation"])
+            for _, r in my_active.iterrows()
+        }
+        cc1, cc2 = st.columns([3, 1])
+        with cc1:
+            to_cancel = st.selectbox(
+                "Annuler une réservation", list(opts.keys()), key="cancel_sel"
+            )
+        with cc2:
+            gap(28)
+            if st.button("🗑️ Annuler", use_container_width=True, key="cancel_btn"):
+                with univ_engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE reservations_salles SET statut = 'annulee' "
+                             "WHERE id_reservation = :r AND id_prof = :pid"),
+                        {"r": opts[to_cancel], "pid": user_id},
+                    )
+                    conn.commit()
+                st.cache_data.clear()
+                st.success("Réservation annulée.")
+                st.rerun()
+    else:
+        st.info("Vous n'avez aucune réservation active.")
+
+    gap(8)
+    st.markdown("**Nouvelle réservation**")
+    if mods_ens.empty:
+        st.warning("Aucun module assigné — réservation indisponible.")
+    else:
+        salle_labels = salles_df.apply(
+            lambda r: f"{r['nom']} ({r['type']}, {r['capacite']} pl.)", axis=1
+        ).tolist()
+        with st.form("form_reservation", clear_on_submit=False):
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                salle_label = st.selectbox("Salle", salle_labels)
+                mod_label   = st.selectbox("Module", mods_ens["intitule"].tolist())
+            with fc2:
+                res_date = st.date_input("Date", value=date.today())
+                h_debut  = st.time_input("Heure début", value=time(8, 0))
+            with fc3:
+                h_fin = st.time_input("Heure fin", value=time(10, 0))
+                gap(28)
+                submit_res = st.form_submit_button(
+                    "🏛️  Réserver", type="primary", use_container_width=True
+                )
+
+        if submit_res:
+            sel_salle    = salles_df.iloc[salle_labels.index(salle_label)]
+            id_salle     = int(sel_salle["id_salle"])
+            code_mod_res = mods_ens.loc[
+                mods_ens["intitule"] == mod_label, "code_module"
+            ].values[0]
+
+            if h_fin <= h_debut:
+                st.error("L'heure de fin doit être postérieure à l'heure de début.")
+            else:
+                # Check-and-insert on a fresh (uncached) connection: a room can't be
+                # double-booked for an overlapping slot on the same date.
+                with univ_engine.connect() as conn:
+                    conflict = conn.execute(
+                        text("""
+                            SELECT r.heure_debut, r.heure_fin, p.nom AS prof
+                            FROM reservations_salles r
+                            JOIN professeurs p ON r.id_prof = p.id_prof
+                            WHERE r.id_salle = :s AND r.date_reservation = :d
+                              AND r.statut = 'confirmee'
+                              AND r.heure_debut < :fin AND r.heure_fin > :debut
+                        """),
+                        {"s": id_salle, "d": res_date, "debut": h_debut, "fin": h_fin},
+                    ).fetchone()
+
+                    if conflict:
+                        st.error(
+                            f"❌ {sel_salle['nom']} est déjà réservée le "
+                            f"{res_date.strftime('%d/%m/%Y')} de {conflict[0]} à "
+                            f"{conflict[1]} (Pr. {conflict[2]})."
+                        )
+                    else:
+                        conn.execute(
+                            text("""
+                                INSERT INTO reservations_salles
+                                (id_prof, id_salle, code_module, date_reservation,
+                                 heure_debut, heure_fin, statut)
+                                VALUES (:p, :s, :m, :d, :hd, :hf, 'confirmee')
+                            """),
+                            {"p": user_id, "s": id_salle, "m": code_mod_res,
+                             "d": res_date, "hd": h_debut, "hf": h_fin},
+                        )
+                        conn.commit()
+                        st.cache_data.clear()
+                        st.success(
+                            f"✅ {sel_salle['nom']} réservée le "
+                            f"{res_date.strftime('%d/%m/%Y')} de {h_debut} à {h_fin}."
+                        )
+                        st.rerun()
 
 
 # ══════════════════════════════════════════════
