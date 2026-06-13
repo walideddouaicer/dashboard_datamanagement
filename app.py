@@ -837,26 +837,23 @@ def show_prof_dashboard(engine, univ_engine, user_id):
     # ════════════════════════════
     section("📝", "Réclamations")
 
+    # Operational read: every claim addressed to this professor, across all modules,
+    # so a freshly filed one is never hidden by the module filter. Description and
+    # réponse come straight from the source table; the professor answers below.
     q_reclam = """
-        SELECT de.nom || ' ' || de.prenom AS etudiant,
-               dp.nom || ' ' || dp.prenom AS professeur,
+        SELECT r.id_reclamation,
+               de.nom || ' ' || de.prenom AS etudiant,
                dm.intitule AS module,
-               fr.type_reclamation, fr.statut,
-               fr.date_depot, fr.date_reponse, fr.delai_traitement,
-               dt.annee_scolaire
-        FROM FAIT_RECLAMATIONS fr
-        JOIN DIM_ETUDIANT de ON fr.num_apogee = de.num_apogee
-        JOIN DIM_PROF dp     ON fr.id_prof    = dp.id_prof
-        JOIN DIM_MODULE dm   ON fr.code_module = dm.code_module
-        JOIN DIM_TEMPS dt    ON fr.id_temps   = dt.id_temps
-        WHERE fr.code_module = :code_mod AND fr.id_prof = :pid
+               r.type_reclamation, r.statut,
+               r.date_reclamation, r.description, r.reponse
+        FROM reclamations r
+        JOIN etudiants de ON r.emetteur_id = de.num_apogee
+        JOIN modules dm   ON r.code_module = dm.code_module
+        WHERE r.destinataire_id = :pid AND r.role_destinataire = 'professeur'
+        ORDER BY (r.statut = 'en_attente') DESC,
+                 r.date_reclamation DESC, r.id_reclamation DESC
     """
-    params_reclam: dict = {"code_mod": code_mod, "pid": user_id}
-    if selected_annee != "Toutes":
-        q_reclam += " AND dt.annee_scolaire = :annee"
-        params_reclam["annee"] = selected_annee
-    q_reclam += " ORDER BY fr.date_depot DESC"
-    df_reclam = query(engine, q_reclam, **params_reclam)
+    df_reclam = query(univ_engine, q_reclam, pid=user_id)
 
     if not df_reclam.empty:
         col_r1, col_r2, col_r3 = st.columns(3)
@@ -893,12 +890,58 @@ def show_prof_dashboard(engine, univ_engine, user_id):
         st.dataframe(
             df_reclam[[
                 "etudiant", "module", "type_reclamation", "statut",
-                "date_depot", "date_reponse", "delai_traitement",
-            ]],
+                "date_reclamation", "description", "reponse",
+            ]].rename(columns={
+                "etudiant": "Étudiant", "module": "Module",
+                "type_reclamation": "Type", "statut": "Statut",
+                "date_reclamation": "Date", "description": "Réclamation",
+                "reponse": "Réponse",
+            }),
             use_container_width=True,
         )
     else:
-        st.info("Aucune réclamation pour ce module / cette période.")
+        st.info("Aucune réclamation reçue pour le moment.")
+
+    # ── Répondre à une réclamation (écriture live dans la base source) ──
+    gap(8)
+    st.markdown("**Répondre à une réclamation**")
+    pending = (df_reclam[df_reclam["statut"] == "en_attente"]
+               if not df_reclam.empty else df_reclam)
+    if pending.empty:
+        st.success("✅ Aucune réclamation en attente.")
+    else:
+        opts = {
+            f"#{int(r.id_reclamation)} — {r.etudiant} · {r.module} : "
+            f"{(r.description[:45] + '…') if len(r.description) > 45 else r.description}":
+            int(r.id_reclamation)
+            for r in pending.itertuples()
+        }
+        sel = st.selectbox("Réclamation en attente", list(opts.keys()),
+                           key="rec_resp_sel")
+        sel_id  = opts[sel]
+        sel_row = pending[pending["id_reclamation"] == sel_id].iloc[0]
+        st.caption(f"« {sel_row['description']} »")
+        reponse_txt = st.text_area(
+            "Votre réponse", key="rec_resp_txt",
+            placeholder="Saisissez votre réponse à l'étudiant…",
+        )
+        if st.button("✅ Marquer comme traitée", type="primary", key="rec_resp_btn"):
+            if not reponse_txt.strip():
+                st.warning("Veuillez saisir une réponse.")
+            else:
+                with univ_engine.connect() as conn:
+                    conn.execute(
+                        text("""
+                            UPDATE reclamations
+                            SET reponse = :rep, statut = 'traitee'
+                            WHERE id_reclamation = :rid AND destinataire_id = :pid
+                        """),
+                        {"rep": reponse_txt.strip(), "rid": sel_id, "pid": user_id},
+                    )
+                    conn.commit()
+                st.cache_data.clear()
+                st.success("Réclamation traitée et réponse enregistrée.")
+                st.rerun()
 
     # ════════════════════════════
     #  5 — RÉSERVATION DE SALLES
@@ -1328,20 +1371,22 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
     # ════════════════════════════
     section("📝", "Réclamations")
 
+    # Read straight from the operational table (not the warehouse) so a claim the
+    # student files below — and the professor's response — appears immediately, and
+    # the free-text description / réponse are visible (the warehouse drops them).
     q_stud_reclam = """
-        SELECT dm.intitule AS module,
-               dp.nom || ' ' || dp.prenom AS professeur,
-               fr.type_reclamation, fr.statut,
-               fr.date_depot, fr.date_reponse, fr.delai_traitement,
-               dt.annee_scolaire
-        FROM FAIT_RECLAMATIONS fr
-        JOIN DIM_MODULE dm ON fr.code_module = dm.code_module
-        JOIN DIM_PROF dp   ON fr.id_prof     = dp.id_prof
-        JOIN DIM_TEMPS dt  ON fr.id_temps    = dt.id_temps
-        WHERE fr.num_apogee = :num
-        ORDER BY fr.date_depot DESC
+        SELECT r.id_reclamation,
+               dm.intitule AS module,
+               p.nom || ' ' || p.prenom AS professeur,
+               r.type_reclamation, r.statut,
+               r.date_reclamation, r.description, r.reponse
+        FROM reclamations r
+        JOIN modules dm    ON r.code_module     = dm.code_module
+        JOIN professeurs p ON r.destinataire_id = p.id_prof
+        WHERE r.emetteur_id = :num AND r.role_emetteur = 'etudiant'
+        ORDER BY r.date_reclamation DESC, r.id_reclamation DESC
     """
-    df_stud_reclam = query(dwh_engine, q_stud_reclam, num=num_apogee)
+    df_stud_reclam = query(univ_engine, q_stud_reclam, num=num_apogee)
 
     if not df_stud_reclam.empty:
         col_rc1, col_rc2, col_rc3 = st.columns(3)
@@ -1353,16 +1398,85 @@ def show_student_dashboard(dwh_engine, univ_engine, num_apogee, user_name, annee
         gap(4)
         st.markdown("**Historique des réclamations**")
         st.dataframe(
-            df_stud_reclam.rename(columns={
+            df_stud_reclam[[
+                "module", "professeur", "type_reclamation", "statut",
+                "date_reclamation", "description", "reponse",
+            ]].rename(columns={
                 "module": "Module", "professeur": "Professeur",
                 "type_reclamation": "Type", "statut": "Statut",
-                "date_depot": "Date dépôt", "date_reponse": "Date réponse",
-                "delai_traitement": "Délai (j)", "annee_scolaire": "Année",
+                "date_reclamation": "Date", "description": "Réclamation",
+                "reponse": "Réponse",
             }),
             use_container_width=True,
         )
     else:
-        st.info("Aucune réclamation pour cet étudiant.")
+        st.info("Vous n'avez déposé aucune réclamation.")
+
+    # ── Déposer une réclamation (écriture live dans la base source) ──
+    gap(8)
+    st.markdown("**Déposer une réclamation**")
+    mods_stud = query(
+        univ_engine,
+        "SELECT code_module, intitule FROM modules "
+        "WHERE annee_etude = :ae ORDER BY intitule",
+        ae=annee_etude,
+    )
+    if mods_stud.empty:
+        st.info("Aucun module disponible pour votre année.")
+    else:
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            mod_label = st.selectbox(
+                "Module concerné", mods_stud["intitule"].tolist(), key="rec_mod"
+            )
+        code_mod_sel = mods_stud.loc[
+            mods_stud["intitule"] == mod_label, "code_module"
+        ].values[0]
+        # Professors teaching the chosen module — fetched outside any st.form so the
+        # list refreshes when the module selection changes.
+        profs_mod = query(
+            univ_engine,
+            "SELECT p.id_prof, p.nom || ' ' || p.prenom AS nom "
+            "FROM enseigne e JOIN professeurs p ON e.id_prof = p.id_prof "
+            "WHERE e.code_module = :cm ORDER BY nom",
+            cm=code_mod_sel,
+        )
+        with rc2:
+            prof_label = st.selectbox(
+                "Professeur",
+                profs_mod["nom"].tolist() if not profs_mod.empty else ["—"],
+                key="rec_prof",
+            )
+        description = st.text_area(
+            "Votre réclamation", key="rec_desc",
+            placeholder="Décrivez votre réclamation en quelques phrases…",
+        )
+        if st.button("📨 Envoyer la réclamation", type="primary", key="rec_send"):
+            if not description.strip():
+                st.warning("Veuillez décrire votre réclamation.")
+            elif profs_mod.empty:
+                st.warning("Aucun professeur n'est associé à ce module.")
+            else:
+                id_prof_sel = int(
+                    profs_mod.loc[profs_mod["nom"] == prof_label, "id_prof"].values[0]
+                )
+                with univ_engine.connect() as conn:
+                    conn.execute(
+                        text("""
+                            INSERT INTO reclamations
+                            (emetteur_id, role_emetteur, destinataire_id,
+                             role_destinataire, code_module, date_reclamation,
+                             type_reclamation, statut, description)
+                            VALUES (:em, 'etudiant', :dest, 'professeur',
+                                    :cm, :d, 'autre', 'en_attente', :desc)
+                        """),
+                        {"em": num_apogee, "dest": id_prof_sel, "cm": code_mod_sel,
+                         "d": date.today(), "desc": description.strip()},
+                    )
+                    conn.commit()
+                st.cache_data.clear()
+                st.success("✅ Votre réclamation a été envoyée au professeur.")
+                st.rerun()
 
     # ════════════════════════════
     #  4 — ÉVÉNEMENTS & ALERTES
